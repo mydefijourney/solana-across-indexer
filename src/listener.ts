@@ -276,7 +276,9 @@ async function processTransaction(signature: string, retries: number = 0) {
               let programId = staticAccountKeys[instr.programIdIndex];
               if(programId.toBase58().toString() == PROGRAM_ID) { 
                   // programId match
-                  thisPda = staticAccountKeys[instr.accountKeyIndexes[7]].toBase58();
+                  if(instr.accountKeyIndexes[7]) { 
+                    thisPda = staticAccountKeys[instr.accountKeyIndexes[7]].toBase58();
+                  }
                   //logMessage(`PDA created: ${thisPda}`);
               } 
             }
@@ -289,7 +291,7 @@ async function processTransaction(signature: string, retries: number = 0) {
                 logMessage("===== FillRelay Event =====");
                 logMessage(`Event Signature: ${signature}`);
                 //logMessage(`PDA created: ${thisPda}`);
-                // console.log(event);
+                //console.log(event);
                 //logMessage("=========================");
 
                 // before we can insert, we need to find the matching depositId
@@ -301,6 +303,40 @@ async function processTransaction(signature: string, retries: number = 0) {
                   const pricesFilePath = '../relayer/configurations/prices.json';
                   const rawPriceJson = fs.readFileSync(pricesFilePath, 'utf-8');
                   let pricesJsonData = JSON.parse(rawPriceJson);
+
+                  let realizedLpFeePct = 0;
+                  let expectedRefund = Number(event.inputAmount);
+                  if(event.repaymentChainId != event.originChainId) {  
+                    try { 
+                      // get the lp fee
+
+                      // convert the inputToken to base58
+                      const hexOutputToken = event.outputToken.replace(/^0x/, ""); // strip "0x"
+                      const bytesOutputToken = Buffer.from(hexOutputToken, "hex");            // convert hex -> bytes
+                      const outputTokenBase58 = new PublicKey(bytesOutputToken).toBase58();
+                      // convert recipient to base58
+                      const hexRecipient = event.recipient.replace(/^0x/, ""); // strip "0x"
+                      const bytesRecipient = Buffer.from(hexRecipient, "hex");            // convert hex -> bytes
+                      const recipientBase58 = new PublicKey(bytesRecipient).toBase58();
+
+                      const feesUrl = `https://across.to/api/suggested-fees?inputToken=${event.inputToken}&originChainId=${event.originChainId}&destinationChainId=${event.destinationChainId}&outputToken=${outputTokenBase58}&amount=${event.inputAmount}&timestamp=${matchingDeposit[0].quoteTimestamp}&recipient=${recipientBase58}`;
+                      //console.log(feesUrl);
+
+                      const feesResponse = await axios.get(feesUrl);
+                      //console.log(feesResponse.data);
+
+                      if(feesResponse.data?.lpFee?.pct) { 
+                        realizedLpFeePct = feesResponse.data?.lpFee?.pct;
+                      }
+
+                      // calculate expectedRefund based on realizedLpFeePct
+                      let lpFeeAmount = Math.round(Number(event.inputAmount) * (realizedLpFeePct / 1e18));
+                      expectedRefund = Number(event.inputAmount) - lpFeeAmount;
+
+                    } catch (error) {
+                      console.error("Error getting suggested fees:", error);
+                    }
+                  } 
 
                   // prepare insert
                   const dataForinsert = { 
@@ -329,11 +365,11 @@ async function processTransaction(signature: string, retries: number = 0) {
                     messageHash: event.messageHash,
                     inputTokenName: event.tokenName,
                     tokenName: event.outputTokenName,
-                    realizedLpFeePct: 0,
+                    realizedLpFeePct: realizedLpFeePct,
                     depositHash: matchingDeposit[0].transactionHash,
                     depositBlockNumber: matchingDeposit[0].blockNumber,
                     depositTimestamp: matchingDeposit[0].timestamp,
-                    expectedRefund: event.inputAmount,
+                    expectedRefund: expectedRefund,
                     txFee: (tx.meta?.fee * 1e9),
                     howManyFills: 1,
                     gasUsed: 0,
@@ -577,7 +613,7 @@ async function main2() {
   //console.log("event", event);
  //processTransaction(`5D7GBZhKxhrfXWEFabeh4J3iVT1vzCVz2cnMvcgTqFwUfh7HJbuCWx2JGKM3jFMovQRt3viU1moAfZqrkyAAyMWv`);
  //processTransaction(`B7LSXrrwqKAZwkz35gRE9DFVUY4jUvc3tsJFuQyZq9vvQWeuPC8muzMvUrdqsT4Kq1kTZvNvZyQr5vbVqCaxdLV`);
- //processTransaction(`X1otekYA2frpTRaLzVVyRuy9TLAJTr8VrpNGnViTUkjVyArBYY9VwKDc3XUS9ELfMybSQbiBjEzwBAQmrSCY2x5`);
+ //processTransaction(`2cfaCgKr5qRha84HDe6DgDdDHYGhhyiBxFvAm7oWBPWGLbEfx9n9qFnQhYoQh4skU8ZD18rQzuNFKukc78Z6x6jo`);
 }
 
 main2();
