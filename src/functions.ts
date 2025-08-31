@@ -2,9 +2,28 @@ import fs from 'fs';
 import bs58 from "bs58";
 import { Buffer } from "buffer";
 import { ethers } from 'ethers';
+import { web3, BN, AnchorProvider, Program, BorshEventCoder, Idl } from "@coral-xyz/anchor";
+import { PublicKey } from "@solana/web3.js";
 
 const tokenConfigRaw = fs.readFileSync("../relayer/configurations/tokens.json", 'utf-8');
 const tokenConfig = JSON.parse(tokenConfigRaw);
+
+export type FillDataValues = [number[], RelayData, BN, PublicKey];
+
+export type RelayData = {
+  depositor: PublicKey;
+  recipient: PublicKey;
+  exclusiveRelayer: PublicKey;
+  inputToken: PublicKey;
+  outputToken: PublicKey;
+  inputAmount: number[];
+  outputAmount: BN;
+  originChainId: BN;
+  depositId: number[];
+  fillDeadline: number;
+  exclusivityDeadline: number;
+  message: Buffer;
+};
 
 export function timeString() {
     const date = new Date();
@@ -127,6 +146,10 @@ export const hexToAddress = (hex: string) => {
 
 export const hexToDecimal = (hex: string) => {
 	return BigInt(parseInt(hex, 16)).toString();
+};
+
+export const hexToBytes32 = (hex: string) => {
+  return `0x${hex.slice(2).replace(/^0+/, "").padStart(64, "0")}`;
 };
 
 
@@ -325,7 +348,7 @@ export function decodeDepositEvent(base58Data: string) {
     const evmTokenAddr = hexToAddress("0x" + inputToken.toString("hex"));
     let tokenName = findOriginToken(originChainId, evmTokenAddr);
     let outputTokenName = findOriginToken(34268394551451, '0x' + outputToken.toString("hex"));
-    let depositKey = `${depositId}_${tokenName}_${repaymentChainId}_34268394551451_${inputAmount}`;
+    let depositKey = `${depositId}_${tokenName}_${originChainId}_34268394551451_${inputAmount}`;
   
     let relayerAddress = '0x' + relayer.toString("hex");
     if(Number(repaymentChainId) != 34268394551451) { 
@@ -462,3 +485,122 @@ export function decodeDepositEvent(base58Data: string) {
     }
   
   }
+  export function intToU8Array32(num: number | BN): number[] {
+    const bigIntValue = BigInt(num instanceof BN ? num.toString() : num);
+    if (bigIntValue < 0) throw new Error("Input must be a non-negative integer or BN");
+  
+    const hexString = bigIntValue.toString(16).padStart(64, "0"); // 32 bytes = 64 hex chars
+    const u8Array = Array.from(Buffer.from(hexString, "hex"));
+  
+    return u8Array;
+  }
+
+  export function calculateRelayHashUint8Array(relayData: any, chainId: BN): Uint8Array {
+    const contentToHash = Buffer.concat([
+      relayData.depositor.toBuffer(),
+      relayData.recipient.toBuffer(),
+      relayData.exclusiveRelayer.toBuffer(),
+      relayData.inputToken.toBuffer(),
+      relayData.outputToken.toBuffer(),
+      Buffer.from(relayData.inputAmount),
+      relayData.outputAmount.toArrayLike(Buffer, "le", 8),
+      relayData.originChainId.toArrayLike(Buffer, "le", 8),
+      Buffer.from(relayData.depositId),
+      new BN(relayData.fillDeadline).toArrayLike(Buffer, "le", 4),
+      new BN(relayData.exclusivityDeadline).toArrayLike(Buffer, "le", 4),
+      hashNonEmptyMessage(relayData.message), // Replace with hash of message, so that relay hash can be recovered from event.
+      chainId.toArrayLike(Buffer, "le", 8),
+    ]);
+  
+    const relayHash = ethers.utils.keccak256(contentToHash);
+    const relayHashBuffer = Buffer.from(relayHash.slice(2), "hex");
+    return new Uint8Array(relayHashBuffer);
+  }
+
+  export function getFillRelayDelegateSeedHash(
+    relayHash: Uint8Array,
+    repaymentChainId: BN,
+    repaymentAddress: PublicKey
+  ): Uint8Array {
+    const contentToHash = Buffer.concat([
+      relayHash,
+      repaymentChainId.toArrayLike(Buffer, "le", 8),
+      repaymentAddress.toBuffer(),
+    ]);
+    const seedHash = ethers.utils.keccak256(contentToHash);
+    return Uint8Array.from(Buffer.from(seedHash.slice(2), "hex"));
+  }
+
+  export function hashNonEmptyMessage(message: Buffer) {
+    if (message.length > 0) {
+      const hash = ethers.utils.keccak256(message);
+      return Uint8Array.from(Buffer.from(hash.slice(2), "hex"));
+    }
+    // else return zeroed bytes32
+    return new Uint8Array(32);
+  }
+  export function getFillRelayDelegatePda(
+    relayHash: Uint8Array,
+    repaymentChainId: BN,
+    repaymentAddress: PublicKey,
+    programId: PublicKey
+  ): { seedHash: Uint8Array; pda: PublicKey } {
+    const seedHash = getFillRelayDelegateSeedHash(relayHash, repaymentChainId, repaymentAddress);
+    const [pda] = PublicKey.findProgramAddressSync([Buffer.from("delegate"), seedHash], programId);
+  
+    return { seedHash, pda };
+  }
+
+  export function decodeEvmDeposit(hexString: string) {
+    const depositDataTypes = [
+        'bytes32',					// inputToken
+        'bytes32',					// outputToken
+        'uint256',					// inputAmount
+        'uint256',					// outputAmount
+        'uint32',					// quoteTimestamp
+        'uint32',					// fillDeadline
+        'uint32',					// exclusivityDeadline
+        'bytes32',					// recipient
+        'bytes32',					// exclusiveRelayer
+        'bytes',					// message
+    ];
+    const abi = new ethers.utils.AbiCoder();
+    const result = abi.decode(depositDataTypes, hexString);
+      return result;
+  }
+
+  export function getEvmRelayHash(deposit: any, destinationChainId: number): string {
+    const abiCoder = new ethers.utils.AbiCoder();
+
+    // Define the tuple structure without names
+    const types = [
+        // Tuple of deposit fields
+        'tuple(bytes32,bytes32,bytes32,bytes32,bytes32,uint256,uint256,uint256,uint256,uint32,uint32,bytes)',
+        // Destination chain ID
+        'uint256'
+    ];
+
+    // Arrange values in correct order (must match the tuple order above)
+    const values = [
+        [
+            deposit.depositor,
+            deposit.recipient,
+            deposit.exclusiveRelayer,
+            deposit.inputToken,
+            deposit.outputToken,
+            deposit.inputAmount.toString(),
+            deposit.outputAmount.toString(),
+            deposit.originChainId.toString(),
+            deposit.depositId.toString(),
+            deposit.fillDeadline,
+            deposit.exclusivityDeadline,
+            deposit.message
+        ],
+        destinationChainId.toString()
+    ];
+
+    //console.log(values);
+
+    const encoded = abiCoder.encode(types, values);
+    return ethers.utils.keccak256(encoded);
+}
